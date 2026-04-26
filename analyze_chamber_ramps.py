@@ -1252,7 +1252,8 @@ def run_analysis(
             ax_hot,
             hot_use,
             "#ffb399",
-            f"Hot dwell (T > {soak_hot_th:g} °C, R window ±{ne} at crossings), n={n} cycles",
+            # f"Hot dwell (T > {soak_hot_th:g} °C, R window ±{ne} at crossings), n={n} cycles",
+            f"Hot dwell (T >= {soak_hot_th:g} °C), n={n} cycles",
         )
         ax_hot.tick_params(axis="x", labelbottom=False)
         ax_hot.set_ylabel(ylabel)
@@ -1260,21 +1261,23 @@ def run_analysis(
             ax_cold,
             cold_use,
             "#9ecae9",
-            f"Cold dwell (T < {soak_cold_th:g} °C, R window ±{ne} at crossings), n={n} cycles",
+            # f"Cold dwell (T < {soak_cold_th:g} °C, R window ±{ne} at crossings), n={n} cycles",
+            f"Cold dwell (T <= {soak_cold_th:g} °C), n={n} cycles",
         )
         ax_cold.set_ylabel(ylabel)
         ax_cold.set_xlabel(
             xlabel_cycle if xlabel_cycle is not None else "Cycle index (1 = first paired cold+hot soak segment in log)"
         )
-        fig.suptitle(title, fontsize=9, y=0.995)
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        fig.suptitle(title, fontsize=9, y=0.99)
+        # subplots_adjust avoids tight_layout UserWarning with sharex + suptitle (mpl 3.6+).
+        fig.subplots_adjust(left=0.10, right=0.98, top=0.90, bottom=0.10, hspace=0.28)
         outp = fig_dir / fname
         fig.savefig(outp, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Wrote {outp}")
 
     soak_short = (
-        f"R from dwell index N after in-cross to N before out-cross (N={ne}); "
+        # f"R from dwell index N after in-cross to N before out-cross (N={ne}); "
         f"cold T<={soak_cold_th:g} °C, hot T>={soak_hot_th:g} °C"
     )
     soak_pool_title_suffix = (
@@ -1413,7 +1416,8 @@ def run_analysis(
                 _annotate_soak_row_global_stats(ax_c, cold_series)
             ax_c.set_xlabel("DUT")
             fig.suptitle(
-                f"Soak R (trimmed) — {gname}, D1–D15 (hot top / cold bottom){soak_pool_title_suffix}\n"
+                # f"Soak R (trimmed) — {gname}, D1–D15 (hot top / cold bottom){soak_pool_title_suffix}\n"
+                f"Dwell R — {gname}, D1–D15 (hot top / cold bottom){soak_pool_title_suffix}\n"
                 f"{soak_short}",
                 fontsize=9,
                 y=0.995,
@@ -1444,7 +1448,8 @@ def run_analysis(
                 hot_gd,
                 cold_gd,
                 title=(
-                    f"Soak R (trimmed) — {g_short}-{d}: {len(hot_gd)} hot + "
+                    # f"Soak R (trimmed) — {g_short}-{d}: {len(hot_gd)} hot + "
+                    f"Dwell R — {g_short}-{d}: {len(hot_gd)} hot + "
                     f"{len(cold_gd)} cold dwells per cycle{soak_pool_title_suffix}\n{soak_short}"
                 ),
                 fname=f"boxplot_soak_{g_short}_{d}_hot_cold_{n_cyc}cycl.png",
@@ -1604,7 +1609,7 @@ def main() -> None:
         default=5,
         metavar="N",
         help=(
-            "Soak resistance uses chamber row indices from the N-th sample after entering the "
+            "Dwell resistance uses chamber row indices from the N-th sample after entering the "
             "hot or cold dwell through the N-th sample before leaving (default 5). "
             "Applies to both hot and cold dwell boxplots and CSVs."
         ),
