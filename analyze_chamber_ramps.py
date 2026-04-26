@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 from matplotlib.transforms import blended_transform_factory
 import numpy as np
 import pandas as pd
+from matplotlib.cbook import boxplot_stats
 
 SENTINEL = 9.9e37
 T_COLD_REF = -40.0
@@ -689,8 +690,19 @@ def _annotate_soak_row_global_stats(ax: plt.Axes, series_list: list[np.ndarray])
     vals = np.concatenate(parts)
     if vals.size == 0:
         return
-    whishi = float(np.max(vals))
-    whislo = float(np.min(vals))
+
+    try:
+        stats = boxplot_stats(parts, whis=1.5)
+    except (ValueError, ZeroDivisionError):
+        return
+    if not stats:
+        return
+
+    # whishi = float(np.max(vals))
+    # whislo = float(np.min(vals))
+    whishi = max(float(s["whishi"]) for s in stats)
+    whislo = min(float(s["whislo"]) for s in stats)
+
     vmean = float((whishi + whislo) / 2.0)
 
 
