@@ -1387,7 +1387,8 @@ def run_analysis(
                 hot_pos,
                 "#ffb399",
                 (
-                    f"Hot dwell (T > {soak_hot_th:g} °C, R window ±{ne} at crossings), {gname} — by DUT "
+                    # f"Hot dwell (T > {soak_hot_th:g} °C, R window ±{ne} at crossings), {gname} — by DUT "
+                    f"Hot dwell (T >= {soak_hot_th:g} °C, {gname} — by DUT "
                     f"(pooled n={n_cyc} cycles){soak_pool_title_suffix}"
                 ),
             )
@@ -1399,7 +1400,8 @@ def run_analysis(
                 cold_pos,
                 "#9ecae9",
                 (
-                    f"Cold dwell (T ≤ {soak_cold_th:g} °C, R window ±{ne} at crossings), {gname} — by DUT "
+                    # f"Cold dwell (T ≤ {soak_cold_th:g} °C, R window ±{ne} at crossings), {gname} — by DUT "
+                    f"Cold dwell (T <= {soak_cold_th:g} °C, {gname} — by DUT "
                     f"(pooled n={n_cyc} cycles){soak_pool_title_suffix}"
                 ),
             )
