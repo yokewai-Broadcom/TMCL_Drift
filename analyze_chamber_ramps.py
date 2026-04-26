@@ -1,7 +1,8 @@
 """
 Chamber 10–90% ramp analysis for ARU@100X.csv (-40 °C to 85 °C span).
 Produces ``ramp_metrics.csv``, ``soak_segment_summary.csv``, optional ``soak_dwell_times.csv``,
-and timestamped ``figures_<YYYYMMDD_HHMMSS>/`` per run. Actual paired soak counts depend on
+``soak_boxplot_resistance_long.csv`` (trimmed R used for soak boxplots), and timestamped
+``figures_<YYYYMMDD_HHMMSS>/`` per run. Actual paired soak counts depend on
 the log; see ``--max-soak-cycles`` (default cap 100; 0 = no cap) and the summary CSV.
 
 CLI: pass a ``.csv`` path or a folder (a ``.csv`` under it is chosen; see ``resolve_csv_input``).
@@ -24,7 +25,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.cbook import boxplot_stats
 from matplotlib.transforms import blended_transform_factory
 import numpy as np
 import pandas as pd
@@ -36,8 +36,8 @@ DT_SPAN = T_HOT_REF - T_COLD_REF  # 125
 T_10 = T_COLD_REF + 0.1 * DT_SPAN  # -27.5
 T_90 = T_COLD_REF + 0.9 * DT_SPAN  # 72.5
 # Minimum wall time (first to last in-trim point) for a soak segment to be used.
-SOAK_MIN_DWELL_MIN_DEFAULT = 21
-TRIMMED_HOT_SOAK = 84.0
+SOAK_MIN_DWELL_MIN_DEFAULT = 15
+TRIMMED_HOT_SOAK = 85.0
 TRIMMED_COLD_SOAK = -40.0
 T_EDGE = 5
 
@@ -50,6 +50,7 @@ _SKIP_DIR_CSV_NAMES = frozenset(
         "exclusion.csv",  # G×DUT omit list; not chamber data
         "soak_segment_summary.csv",  # written by this tool; not chamber data
         "soak_dwell_times.csv",  # written by this tool; not chamber data
+        "soak_boxplot_resistance_long.csv",  # written by this tool; not chamber data
     }
 )
 
@@ -142,16 +143,16 @@ def read_data(csv_path: Path) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
             df.loc[df[c] >= 1e36, c] = np.nan
-    # df["ChamberT(M)"] = pd.to_numeric(df["ChamberT(M)"], errors="coerce")
-    df["ChamberT(T)"] = pd.to_numeric(df["ChamberT(T)"], errors="coerce")
+    df["ChamberT(M)"] = pd.to_numeric(df["ChamberT(M)"], errors="coerce")
+    #df["ChamberT(T)"] = pd.to_numeric(df["ChamberT(T)"], errors="coerce")
     return df
 
 
 def chamber_series(df: pd.DataFrame) -> pd.DataFrame:
     """One row per timestamp; ChamberT is same for all groups."""
     g = df.groupby("timestamp", as_index=False).agg(
-        # T=("ChamberT(M)", "first"),
-        T=("ChamberT(T)", "first"),
+        T=("ChamberT(M)", "first"),
+        #T=("ChamberT(T)", "first"),
         # ProgData=("ProgData", "first") if "ProgData" in df.columns else ("ChamberT(M)", "first"),
         ProgData=("ProgData", "first") if "ProgData" in df.columns else ("ChamberT(T)", "first"),
 
@@ -247,17 +248,13 @@ def find_trimmed_cold_soak_intervals(
     n_edge: int = T_EDGE, #5,
 ) -> list[tuple[int, int]]:
     """
-    Cold dwell window (indices into T, inclusive), independent of ramp 10–90% logic.
-
-    Per cold soak after a down-cross from above ``threshold``:
-    - **Start**: first index with T strictly below ``threshold`` (if none, first T <= threshold).
-    - **End**: last index before T ramps above ``threshold`` (last in-soak sample before the
-      first T > threshold).
-
-    ``n_edge`` is ignored for cold dwells (kept for API compatibility with callers that pass
-    ``--soak-edge-readings``; that flag applies to **hot** soak trimming only).
+    Cold dwell **resistance** window (chamber row indices, inclusive), independent of ramp
+    10–90% logic. After the physical cold dwell (first T below ``threshold`` through the last
+    in-soak sample before the up-cross to above ``threshold``),     the window is the ``n_edge``-th
+    in-dwell sample *after* the initial down-cross through the ``n_edge``-th sample *before* the
+    exit up-cross (same bookends as hot soak, controlled by ``--soak-edge-readings`` / ``n_edge``).
+    If the raw dwell is too short for this trim, the segment is skipped.
     """
-    _ = n_edge  # cold dwell uses physical −40 °C crossings only
     n = len(T)
     out: list[tuple[int, int]] = []
     search_from = 0
@@ -291,7 +288,10 @@ def find_trimmed_cold_soak_intervals(
             break
         e = j - 1
         if e >= s:
-            out.append((s, e))
+            a = s + n_edge - 1
+            b = e - (n_edge - 1)
+            if b >= a:
+                out.append((a, b))
         search_from = j
     return out
 
@@ -303,12 +303,13 @@ def find_trimmed_hot_soak_intervals(
     n_edge: int = T_EDGE, #1,
 ) -> list[tuple[int, int]]:
     """
-    Hot soak resistance window (indices inclusive):
-    - Ramp up beyond threshold: T[i] <= threshold and T[i+1] > threshold.
-    - Require n_edge consecutive readings with T > threshold.
-    - Data starts at streak_start + n_edge.
-    - Ramp down below threshold: T[w-1] > threshold and T[w] <= threshold.
-    - Exclude last n_edge readings before down-cross (end = w-1-n_edge).
+    Hot soak **resistance** window (chamber indices inclusive):
+    - Up-cross into hot: ``T[i] <= threshold < T[i+1]``; first in-dwell index ``d0 = i + 1``.
+    - Down-cross out: first ``w`` with ``T[w-1] > threshold`` and ``T[w] <= threshold``;
+      last in-dwell index ``d1 = w - 1``.
+    - Trimming: use the ``n_edge``-th in-dwell sample (``d0 + n_edge - 1``) through the
+      ``n_edge``-th sample from the end of dwell (``d1 - (n_edge - 1)``), matching
+      ``--soak-edge-readings``. If that window is empty, the segment is skipped.
     """
     n = len(T)
     out: list[tuple[int, int]] = []
@@ -321,26 +322,22 @@ def find_trimmed_hot_soak_intervals(
                 break
         if i is None:
             break
-        streak_start = None
-        s0 = i + 1
-        for s in range(s0, n - n_edge + 1):
-            if bool(np.all(T[s : s + n_edge] > threshold)):
-                streak_start = s
-                break
-        if streak_start is None:
+        d0 = i + 1
+        if d0 >= n or T[d0] <= threshold:
             search_from = i + 1
             continue
-        data_start = streak_start + n_edge
         w = None
-        for j in range(max(data_start + 1, i + 2), n):
+        for j in range(d0 + 1, n):
             if T[j - 1] > threshold and T[j] <= threshold:
                 w = j
                 break
         if w is None:
             break
-        data_end = w - 1 - n_edge
-        if data_end >= data_start:
-            out.append((data_start, data_end))
+        d1 = w - 1
+        a = d0 + n_edge - 1
+        b = d1 - (n_edge - 1)
+        if b >= a:
+            out.append((a, b))
         search_from = w
     return out
 
@@ -679,11 +676,10 @@ def _resistance_minmax_midpoint(arr: np.ndarray) -> float:
 
 def _annotate_soak_row_global_stats(ax: plt.Axes, series_list: list[np.ndarray]) -> None:
     """
-    Whiskers aligned with matplotlib boxplot (whis=1.5, no outliers drawn): use each
-    series' whisker hi/lo from boxplot_stats; max/min marker y = max(whishi), min(whislo)
-    across DUTs. A middle marker at pooled mean (between whisker hi/lo). Percentages vs
-    pooled mean only beside max/min; markers drawn outside data area (axes x>1).
-    Each label shows the value line below the % or "middle" line.
+    Side markers: ``whishi`` = max finite resistance in *all* pooled boxplot data for the row
+    (includes points that are outliers in the IQR boxplot), ``whislo`` = min likewise.
+    Middle mark = midpoint between that max and min. Markers to the right of the axes;
+    each label shows the value line below the % or "middle" line.
     """
     if not series_list:
         return
@@ -693,17 +689,9 @@ def _annotate_soak_row_global_stats(ax: plt.Axes, series_list: list[np.ndarray])
     vals = np.concatenate(parts)
     if vals.size == 0:
         return
-    vmean = float(np.mean(vals))
-
-    try:
-        stats = boxplot_stats(parts, whis=1.5)
-    except (ValueError, ZeroDivisionError):
-        return
-    if not stats:
-        return
-    whishi = max(float(s["whishi"]) for s in stats)
-    whislo = min(float(s["whislo"]) for s in stats)
-    vmean = float((whishi + whislo)/2)  #ywfoo
+    whishi = float(np.max(vals))
+    whislo = float(np.min(vals))
+    vmean = float((whishi + whislo) / 2.0)
 
 
     pct_up = None if vmean == 0 else 100.0 * (whishi - vmean) / vmean
@@ -774,7 +762,8 @@ def run_analysis(
     out_dir: Path | None = None,
     cold_max: float = -32.0,
     hot_min: float = 78.0,
-    soak_edge_readings: int = 5, #1, ywfoo
+    soak_edge_readings: int = 5,
+    #soak_edge_readings: int = 20, #15,
     soak_cold_th: float = -40.0,
     soak_hot_th: float = 85.0,
     exclusion_csv: Path | None = None,
@@ -784,12 +773,16 @@ def run_analysis(
     """
     Run chamber ramp analysis on ``csv_path``.
 
-    Writes ``ramp_metrics.csv``, ``soak_segment_summary.csv``, and ``soak_dwell_times.csv``
-    (per-cycle cold/hot dwell minutes) under ``out_dir`` and
+    Writes ``ramp_metrics.csv``, ``soak_segment_summary.csv``, ``soak_dwell_times.csv``,
+    ``soak_boxplot_resistance_long.csv`` (trimmed R used for soak boxplots), under ``out_dir`` and
     PNG figures in a new subfolder ``figures_<YYYYMMDD_HHMMSS>`` each run.
 
     Soak resistance figures respect optional ``exclusion_csv`` (default:
     ``csv_path.parent / "exclusion.csv"``) listing ``G*D*`` pairs to omit.
+
+    ``soak_edge_readings`` (``--soak-edge-readings``): for each hot/cold dwell, resistance
+    uses the chamber time span from the N-th in-dwell sample after the start crossing to
+    the N-th sample before the end crossing (default N=5).
 
     ``max_soak_cycles``: after pairing hot and cold dwell intervals on the main file,
     use at most this many pairs (default 100). Use ``0`` for no cap (per-cycle figure
@@ -906,8 +899,8 @@ def run_analysis(
     axes[0].axhline(T_10, color="k", linestyle=":", linewidth=0.8, alpha=0.5)
     axes[0].axhline(T_90, color="k", linestyle=":", linewidth=0.8, alpha=0.5)
     axes[0].set_xlabel("Time since ramp start (s)")
-    # axes[0].set_ylabel("ChamberT(M) (°C)")
-    axes[0].set_ylabel("ChamberT(T) (°C)")
+    axes[0].set_ylabel("ChamberT(M) (°C)")
+    #axes[0].set_ylabel("ChamberT(T) (°C)")
     axes[0].set_title("Heating ramps (overlay)")
     axes[0].set_ylim(-45, 95)
     axes[0].text(
@@ -943,8 +936,8 @@ def run_analysis(
         fontsize=8,
         bbox=dict(boxstyle="round,pad=0.35", facecolor="lightcyan", alpha=0.85, edgecolor="0.5"),
     )
-    # fig.suptitle("ChamberT(M): all ramps (raw)", y=1.02)
-    fig.suptitle("ChamberT(T): all ramps (raw)", y=1.02)
+    fig.suptitle("ChamberT(M): all ramps (raw)", y=1.02)
+    #fig.suptitle("ChamberT(T): all ramps (raw)", y=1.02)
     fig.tight_layout()
     oc_path = fig_dir / "overlay_chamber_ramps.png"
     fig.savefig(oc_path, dpi=150, bbox_inches="tight")
@@ -961,10 +954,10 @@ def run_analysis(
     else:
         print(f"Soak figures: no group×DUT exclusions (read {exclusion_path.name}).")
 
-    # --- Soak resistance: cold = full dwell from first T < soak_cold_th after down-cross through
-    # last sample before T > soak_cold_th; hot = trimmed with soak_edge_readings (independent of ramp 10–90).
+    # --- Soak resistance: chamber index window = N-th row after in-dwell cross through N-th before
+    # out-dwell cross (N = soak_edge_readings) for both cold and hot; then all R in that time span.
     T_arr = ch["T"].to_numpy(dtype=float)
-    ne = soak_edge_readings
+    ne = 15 #soak_edge_readings
     cold_main = find_trimmed_cold_soak_intervals(
         T_arr, threshold=soak_cold_th, n_edge=ne
     )
@@ -1259,7 +1252,7 @@ def run_analysis(
             ax_hot,
             hot_use,
             "#ffb399",
-            f"Hot dwell (T > {soak_hot_th:g} °C trimmed), n={n} cycles",
+            f"Hot dwell (T > {soak_hot_th:g} °C, R window ±{ne} at crossings), n={n} cycles",
         )
         ax_hot.tick_params(axis="x", labelbottom=False)
         ax_hot.set_ylabel(ylabel)
@@ -1267,7 +1260,7 @@ def run_analysis(
             ax_cold,
             cold_use,
             "#9ecae9",
-            f"Cold dwell (first T < {soak_cold_th:g} °C → last before T > {soak_cold_th:g} °C), n={n} cycles",
+            f"Cold dwell (T < {soak_cold_th:g} °C, R window ±{ne} at crossings), n={n} cycles",
         )
         ax_cold.set_ylabel(ylabel)
         ax_cold.set_xlabel(
@@ -1281,14 +1274,17 @@ def run_analysis(
         print(f"Wrote {outp}")
 
     soak_short = (
-        f"Cold dwell: first T<={soak_cold_th:g} °C; "
-        f"hot dwell: T>={soak_hot_th:g} °C"
+        f"R from dwell index N after in-cross to N before out-cross (N={ne}); "
+        f"cold T<={soak_cold_th:g} °C, hot T>={soak_hot_th:g} °C"
     )
     soak_pool_title_suffix = (
         " (Initial set 0 + main cycles)"
         if (dual_soak and use_init0)
         else ""
     )
+
+    # One row per finite resistance sample fed into soak boxplots (D1–D15 + per-cycle figures).
+    soak_boxplot_r_rows: list[dict[str, object]] = []
 
     for gi in range(1, 7):
         gname = f"Grp {gi}"
@@ -1322,6 +1318,27 @@ def run_analysis(
             if c_m.size > 0:
                 cold_series.append(c_m)
                 cold_pos.append(slot)
+            for dwell, tagged in (("hot", hot_tagged), ("cold", cold_tagged)):
+                for pair_i, (src, (i0, i1)) in enumerate(tagged):
+                    arr = resistances_tagged(src, i0, i1, gname, dut_col=d)
+                    v = np.asarray(arr, dtype=float)
+                    v = v[np.isfinite(v)]
+                    cyc = int(cycle_index_base + pair_i)
+                    for val in v:
+                        soak_boxplot_r_rows.append(
+                            {
+                                "group": gname,
+                                "group_index": gi,
+                                "dut": d,
+                                "dwell_type": dwell,
+                                "pair_order": pair_i,
+                                "cycle_index": cyc,
+                                "source": src,
+                                "chamber_index_start": i0,
+                                "chamber_index_end": i1,
+                                "resistance": float(val),
+                            }
+                        )
 
         if hot_series or cold_series:
             fig_w = max(12.0, 0.72 * len(D_COLS))
@@ -1367,7 +1384,7 @@ def run_analysis(
                 hot_pos,
                 "#ffb399",
                 (
-                    f"Hot dwell (T > {soak_hot_th:g} °C), {gname} — by DUT "
+                    f"Hot dwell (T > {soak_hot_th:g} °C, R window ±{ne} at crossings), {gname} — by DUT "
                     f"(pooled n={n_cyc} cycles){soak_pool_title_suffix}"
                 ),
             )
@@ -1379,7 +1396,7 @@ def run_analysis(
                 cold_pos,
                 "#9ecae9",
                 (
-                    f"Cold dwell (T ≤ {soak_cold_th:g} °C), {gname} — by DUT "
+                    f"Cold dwell (T ≤ {soak_cold_th:g} °C, R window ±{ne} at crossings), {gname} — by DUT "
                     f"(pooled n={n_cyc} cycles){soak_pool_title_suffix}"
                 ),
             )
@@ -1435,6 +1452,27 @@ def run_analysis(
                 cycle_index_base=cycle_index_base,
                 xlabel_cycle=cycle_xlabel,
             )
+
+    soak_r_log_path = out_dir_resolved / "soak_boxplot_resistance_long.csv"
+    _r_cols = [
+        "group",
+        "group_index",
+        "dut",
+        "dwell_type",
+        "pair_order",
+        "cycle_index",
+        "source",
+        "chamber_index_start",
+        "chamber_index_end",
+        "resistance",
+    ]
+    if soak_boxplot_r_rows:
+        pd.DataFrame(soak_boxplot_r_rows).to_csv(soak_r_log_path, index=False)
+    else:
+        pd.DataFrame(columns=_r_cols).to_csv(soak_r_log_path, index=False)
+    print(
+        f"Wrote {soak_r_log_path.name} ({len(soak_boxplot_r_rows)} resistance sample(s) used for soak boxplots)."
+    )
 
     return out_dir_resolved
 
@@ -1548,7 +1586,7 @@ def main() -> None:
         default=None,
         help=(
             "Output folder for ramp_metrics.csv, soak_segment_summary.csv, "
-            "soak_dwell_times.csv (if cycles exist), and figures_<timestamp>/ "
+            "soak_dwell_times.csv (if cycles exist), soak_boxplot_resistance_long.csv, and figures_<timestamp>/ "
             "(default: same folder as the input CSV)."
         ),
     )
@@ -1564,9 +1602,11 @@ def main() -> None:
         "--soak-edge-readings",
         type=int,
         default=5,
+        metavar="N",
         help=(
-            "Hot soak only: consecutive T>hot-threshold readings after up-cross before dwell start; "
-            "same count trimmed before hot down-cross. Cold dwell uses full −40 °C crossing window (no trim)."
+            "Soak resistance uses chamber row indices from the N-th sample after entering the "
+            "hot or cold dwell through the N-th sample before leaving (default 5). "
+            "Applies to both hot and cold dwell boxplots and CSVs."
         ),
     )
     p.add_argument("--soak-cold-th", type=float, default=-40.0)
@@ -1610,6 +1650,9 @@ def main() -> None:
         sys.exit(1)
     if args.soak_min_dwell_minutes < 0:
         print("Error: --soak-min-dwell-minutes must be >= 0 (0 = disable).", file=sys.stderr)
+        sys.exit(1)
+    if args.soak_edge_readings < 1:
+        print("Error: --soak-edge-readings must be >= 1.", file=sys.stderr)
         sys.exit(1)
     run_analysis(
         csv_path,
