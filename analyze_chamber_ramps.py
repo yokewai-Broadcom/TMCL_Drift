@@ -663,18 +663,6 @@ def _resolve_csv_for_analysis(csv_path: Path) -> tuple[Path, bool, Path | None]:
     return csv_path, True, init
 
 
-def _resistance_minmax_midpoint(arr: np.ndarray) -> float:
-    """
-    Midpoint between the lowest and highest *finite* resistance in ``arr`` (per-box
-    "center line" in soak boxplots, instead of the median).
-    """
-    v = np.asarray(arr, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size == 0:
-        return 0.0
-    return float((float(v.min()) + float(v.max())) / 2.0)
-
-
 def _annotate_soak_row_global_stats(ax: plt.Axes, series_list: list[np.ndarray]) -> None:
     """
     Side markers: ``whishi`` = max finite resistance in *all* pooled boxplot data for the row
@@ -1242,7 +1230,6 @@ def run_analysis(
                 widths=w,
                 showfliers=False,
                 patch_artist=True,
-                usermedians=[_resistance_minmax_midpoint(s) for s in series],
             )
             for patch in bp["boxes"]:
                 patch.set_facecolor(face)
@@ -1380,7 +1367,6 @@ def run_analysis(
                     widths=w,
                     showfliers=False,
                     patch_artist=True,
-                    usermedians=[_resistance_minmax_midpoint(s) for s in series],
                 )
                 for patch in bp["boxes"]:
                     patch.set_facecolor(face)
