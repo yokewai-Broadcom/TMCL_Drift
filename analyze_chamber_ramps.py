@@ -1118,14 +1118,14 @@ def run_analysis(
         median_h = float(dwell_df["hot_dwell_min"].median())
         min_h = float(dwell_df["hot_dwell_min"].min())
         max_h = float(dwell_df["hot_dwell_min"].max())
-        print(
-            f"  Cold dwell (min): mean={mean_c:.2f}, median={median_c:.2f}, "
-            f"min={min_c:.2f}, max={max_c:.2f}"
-        )
-        print(
-            f"  Hot dwell (min):  mean={mean_h:.2f}, median={median_h:.2f}, "
-            f"min={min_h:.2f}, max={max_h:.2f}"
-        )
+        # print(
+        #     f"  Cold dwell (min): mean={mean_c:.2f}, median={median_c:.2f}, "
+        #     f"min={min_c:.2f}, max={max_c:.2f}"
+        # )
+        # print(
+        #     f"  Hot dwell (min):  mean={mean_h:.2f}, median={median_h:.2f}, "
+        #     f"min={min_h:.2f}, max={max_h:.2f}"
+        # )
         _n_show = 15
         if len(dwell_df) <= _n_show:
             print("  Per-cycle cold / hot dwell (minutes):")
@@ -1136,14 +1136,15 @@ def run_analysis(
                     f"hot {r['hot_dwell_min']:.2f} ({r['hot_source']})"
                 )
         else:
-            print(f"  Per-cycle (first {_n_show} of {len(dwell_df)}) cold / hot dwell (minutes):")
-            for _, r in dwell_df.head(_n_show).iterrows():
-                print(
-                    f"    cycle {int(r['cycle_index'])}: "
-                    f"cold {r['cold_dwell_min']:.2f} ({r['cold_source']}), "
-                    f"hot {r['hot_dwell_min']:.2f} ({r['hot_source']})"
-                )
-            print(f"    … see {soak_dwell_path.name} for all cycles.")
+            pass
+            # print(f"  Per-cycle (first {_n_show} of {len(dwell_df)}) cold / hot dwell (minutes):")
+            # for _, r in dwell_df.head(_n_show).iterrows():
+            #     print(
+            #         f"    cycle {int(r['cycle_index'])}: "
+            #         f"cold {r['cold_dwell_min']:.2f} ({r['cold_source']}), "
+            #         f"hot {r['hot_dwell_min']:.2f} ({r['hot_source']})"
+            #     )
+            # print(f"    … see {soak_dwell_path.name} for all cycles.")
     else:
         print("Soak dwell times: no paired cycles; soak_dwell_times.csv not written.")
 
