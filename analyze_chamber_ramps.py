@@ -9,8 +9,9 @@ CLI: pass a ``.csv`` path or a folder (a ``.csv`` under it is chosen; see ``reso
 
 If a folder has exactly ``Initial.csv`` (case-insensitive) plus one other root ``.csv``,
 ramps and overlay plots use the non-Initial file; soak boxplots prepend set 0 from the
-first cold+hot soak in Initial.csv, then all available paired cold/hot dwells from the
-main file (see ``--max-soak-cycles`` for an optional cap on how many main cycles to use).
+first cold+hot soak in Initial.csv when dwell rules pass, then paired cold/hot dwells from the
+main file. Dwell resistance omits cycles where the approach ramp is not monotonic; overlay
+plots show only monotonic ramps (see ``run_analysis`` docstring).
 """
 
 from __future__ import annotations
@@ -41,6 +42,8 @@ SOAK_MIN_DWELL_MIN_DEFAULT = 15
 TRIMMED_HOT_SOAK = 85.0
 TRIMMED_COLD_SOAK = -40.0
 T_EDGE = 5
+# Allow small step-to-step noise when checking T monotonicity on a ramp (°C per sample).
+RAMP_MONOTONICITY_TOL_C = 0.05
 
 
 D_COLS = [f"D{i}" for i in range(1, 16)]
@@ -362,13 +365,21 @@ def build_soak_dwell_time_table(
     ch_init: pd.DataFrame | None,
     *,
     cycle_index_base: int,
+    cold_dwell_r_monotonic_approach: list[bool] | None = None,
+    hot_dwell_r_monotonic_approach: list[bool] | None = None,
 ) -> pd.DataFrame:
     """
     One row per paired cold/hot dwell with wall-time minutes (first→last in-segment index).
     ``cycle_index`` matches soak boxplot x-axis labels (``cycle_index_base`` + zero-based pair index).
+
+    When ``cold_dwell_r_monotonic_approach`` / ``hot_dwell_r_monotonic_approach`` are provided
+    (same length as pairs), they record whether the temperature ramp into that dwell was
+    monotonic; dwell resistance is only taken from cycles where the corresponding flag is True.
     """
     n = min(len(cold_tagged), len(hot_tagged))
     rows: list[dict[str, object]] = []
+    c_mono = cold_dwell_r_monotonic_approach
+    h_mono = hot_dwell_r_monotonic_approach
     for idx in range(n):
         cs, c_iv = cold_tagged[idx]
         hs, h_iv = hot_tagged[idx]
@@ -378,20 +389,23 @@ def build_soak_dwell_time_table(
         h0, h1 = h_iv
         t_c_min = soak_interval_duration_minutes(ch_c, c0, c1)
         t_h_min = soak_interval_duration_minutes(ch_h, h0, h1)
-        rows.append(
-            {
-                "cycle_index": int(cycle_index_base + idx),
-                "pair_order": idx,
-                "cold_source": cs,
-                "hot_source": hs,
-                "cold_dwell_min": t_c_min,
-                "hot_dwell_min": t_h_min,
-                "cold_t_start": ch_c["timestamp"].iloc[c0],
-                "cold_t_end": ch_c["timestamp"].iloc[c1],
-                "hot_t_start": ch_h["timestamp"].iloc[h0],
-                "hot_t_end": ch_h["timestamp"].iloc[h1],
-            }
-        )
+        row: dict[str, object] = {
+            "cycle_index": int(cycle_index_base + idx),
+            "pair_order": idx,
+            "cold_source": cs,
+            "hot_source": hs,
+            "cold_dwell_min": t_c_min,
+            "hot_dwell_min": t_h_min,
+            "cold_t_start": ch_c["timestamp"].iloc[c0],
+            "cold_t_end": ch_c["timestamp"].iloc[c1],
+            "hot_t_start": ch_h["timestamp"].iloc[h0],
+            "hot_t_end": ch_h["timestamp"].iloc[h1],
+        }
+        if c_mono is not None and len(c_mono) > idx:
+            row["cold_dwell_r_monotonic_approach"] = bool(c_mono[idx])
+        if h_mono is not None and len(h_mono) > idx:
+            row["hot_dwell_r_monotonic_approach"] = bool(h_mono[idx])
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -478,6 +492,7 @@ def find_ramps(ch: pd.DataFrame, cold_max: float, hot_min: float) -> tuple[list[
                     "i1": cold_start,
                     "t_sec": t_sec,
                     "T": T,
+                    "is_leading": True,
                 }
             )
 
@@ -528,6 +543,7 @@ def find_ramps(ch: pd.DataFrame, cold_max: float, hot_min: float) -> tuple[list[
                     "i1": end_idx,
                     "t_sec": t_sec,
                     "T": T,
+                    "is_leading": False,
                 }
             )
 
@@ -609,6 +625,126 @@ def heating_ramp_10_90_rate_c_per_min(ramp: dict) -> float:
     if dt <= 0:
         return float("nan")
     return float((T_90 - T_10) / dt * 60.0)
+
+
+def ramp_temperature_monotonic_heating(ramp: dict) -> bool:
+    """True if chamber T is (approximately) non-decreasing along the heating ramp slice."""
+    i0, i1 = ramp["i0"], ramp["i1"]
+    T = ramp["T"][i0 : i1 + 1]
+    if len(T) < 2:
+        return True
+    return bool(np.min(np.diff(T)) >= -RAMP_MONOTONICITY_TOL_C)
+
+
+def ramp_temperature_monotonic_cooling(ramp: dict) -> bool:
+    """True if chamber T is (approximately) non-increasing along the cooling ramp slice."""
+    i0, i1 = ramp["i0"], ramp["i1"]
+    T = ramp["T"][i0 : i1 + 1]
+    if len(T) < 2:
+        return True
+    return bool(np.max(np.diff(T)) <= RAMP_MONOTONICITY_TOL_C)
+
+
+def heating_ramp_include_in_overlay(ramp: dict) -> bool:
+    """Overlay only monotonic heating ramps with a valid 10–90% crossing window."""
+    if not ramp_temperature_monotonic_heating(ramp):
+        return False
+    return measure_heating_10_90(ramp)[2] == "ok"
+
+
+def cooling_ramp_include_in_overlay(ramp: dict) -> bool:
+    """
+    Overlay only monotonic cooling ramps. Leading (initial) ramp-down may sit below T_90 for
+    the whole segment; those are still shown when monotonic. Other ramps need 10–90% metrics.
+    """
+    if not ramp_temperature_monotonic_cooling(ramp):
+        return False
+    if ramp.get("is_leading"):
+        return True
+    return measure_cooling_10_90(ramp)[2] == "ok"
+
+
+def main_has_leading_cooling_ramp(cooling: list[dict]) -> bool:
+    return bool(cooling and cooling[0].get("is_leading"))
+
+
+def main_cooling_ramp_index_for_cold_dwell(
+    cold_dwell_index_main: int,
+    *,
+    has_leading: bool,
+    n_cooling: int,
+) -> int | None:
+    """
+    Index into ``find_ramps`` cooling list for the ramp that precedes the ``cold_dwell_index_main``-th
+    cold soak on the main file (0-based among main cold dwells). None = no ramp (vacuously valid for R).
+    """
+    if has_leading:
+        if cold_dwell_index_main < 0 or cold_dwell_index_main >= n_cooling:
+            return None
+        return cold_dwell_index_main
+    if cold_dwell_index_main <= 0:
+        return None
+    j = cold_dwell_index_main - 1
+    return j if 0 <= j < n_cooling else None
+
+
+def soak_dwell_resistance_monotonic_flags(
+    cold_tagged: list[tuple[str, tuple[int, int]]],
+    hot_tagged: list[tuple[str, tuple[int, int]]],
+    *,
+    use_init0: bool,
+    heating_main: list[dict],
+    cooling_main: list[dict],
+    heating_init: list[dict],
+    cooling_init: list[dict],
+    main_has_leading: bool,
+) -> tuple[list[bool], list[bool]]:
+    """
+    Per pair index: whether dwell resistance should be pooled/plotted (approach ramp monotonic).
+    Initial ramp-down: valid cold soak R only if leading cooling is monotonic; first hot after
+    monotonic heating. Main cycles: cold after monotonic cooling into that cold; hot after monotonic heat.
+    """
+    n = min(len(cold_tagged), len(hot_tagged))
+    cold_ok: list[bool] = []
+    hot_ok: list[bool] = []
+    init_lead = bool(cooling_init and cooling_init[0].get("is_leading"))
+    n_cool_m = len(cooling_main)
+    n_heat_m = len(heating_main)
+
+    for i in range(n):
+        cs, _ = cold_tagged[i]
+        hs, _ = hot_tagged[i]
+
+        if cs == "init":
+            if init_lead and cooling_init:
+                cold_ok.append(ramp_temperature_monotonic_cooling(cooling_init[0]))
+            else:
+                cold_ok.append(True)
+        else:
+            k_main = i - (1 if use_init0 else 0)
+            ci = main_cooling_ramp_index_for_cold_dwell(
+                k_main, has_leading=main_has_leading, n_cooling=n_cool_m
+            )
+            if ci is None:
+                cold_ok.append(True)
+            elif 0 <= ci < n_cool_m:
+                cold_ok.append(ramp_temperature_monotonic_cooling(cooling_main[ci]))
+            else:
+                cold_ok.append(False)
+
+        if hs == "init":
+            if heating_init:
+                hot_ok.append(ramp_temperature_monotonic_heating(heating_init[0]))
+            else:
+                hot_ok.append(False)
+        else:
+            k_main = i - (1 if use_init0 else 0)
+            if 0 <= k_main < n_heat_m:
+                hot_ok.append(ramp_temperature_monotonic_heating(heating_main[k_main]))
+            else:
+                hot_ok.append(False)
+
+    return cold_ok, hot_ok
 
 
 def _app_base_dir() -> Path:
@@ -794,6 +930,14 @@ def run_analysis(
     complete or the list is empty. For ``Initial.csv`` set 0, the first cold+hot pair is
     skipped if either side is under the minimum. Use ``0`` to disable.
 
+    Dwell resistance (pooled and per-cycle soak boxplots, ``soak_boxplot_resistance_long.csv``)
+    uses only cycles where the chamber temperature ramp **into** that dwell is monotonic
+    (non-decreasing into hot, non-increasing into cold), within a small step tolerance.
+    The initial ramp-down in ``Initial.csv`` counts when the leading cooling ramp is monotonic.
+    ``overlay_chamber_ramps.png`` plots only those monotonic ramps; leading ramp-down may appear
+    without a full T_90→T_10 window when monotonic. ``ramp_metrics.csv`` includes a
+    ``temperature_monotonic`` column per ramp.
+
     Returns the resolved output directory.
     """
     csv_path, dual_soak, initial_csv_path = _resolve_csv_for_analysis(csv_path.resolve())
@@ -844,6 +988,7 @@ def run_analysis(
                 "time_10_90_s": dt,
                 "ramp_rate_10_90_c_per_min": heating_ramp_10_90_rate_c_per_min(ramp),
                 "status": status,
+                "temperature_monotonic": ramp_temperature_monotonic_heating(ramp),
             }
         )
 
@@ -864,6 +1009,7 @@ def run_analysis(
                 "time_10_90_s": dt,
                 "ramp_rate_10_90_c_per_min": cooling_ramp_10_90_rate_c_per_min(ramp),
                 "status": status,
+                "temperature_monotonic": ramp_temperature_monotonic_cooling(ramp),
             }
         )
 
@@ -872,26 +1018,47 @@ def run_analysis(
     metrics.to_csv(metrics_path, index=False)
     print(f"Wrote {metrics_path}")
 
-    # Overlay ChamberT vs time-from-ramp-start (seconds from i0)
+    # Overlay: monotonic ramps only; leading initial ramp-down may plot without full T_90→T_10 window.
     heat_1090_c_per_min = np.array(
         [heating_ramp_10_90_rate_c_per_min(r) for r in heating], dtype=float
     )
-    n_hr = int(np.sum(np.isfinite(heat_1090_c_per_min)))
-    avg_ramp_up = float(np.nanmean(heat_1090_c_per_min))
-
     cool_1090_c_per_min = np.array(
         [cooling_ramp_10_90_rate_c_per_min(r) for r in cooling], dtype=float
     )
-    n_cr = int(np.sum(np.isfinite(cool_1090_c_per_min)))
-    avg_ramp_down = float(np.nanmean(cool_1090_c_per_min))
+    n_hr_all = int(np.sum(np.isfinite(heat_1090_c_per_min)))
+    n_cr_all = int(np.sum(np.isfinite(cool_1090_c_per_min)))
+    heat_overlay_rates = np.array(
+        [
+            heating_ramp_10_90_rate_c_per_min(r)
+            for r in heating
+            if heating_ramp_include_in_overlay(r)
+        ],
+        dtype=float,
+    )
+    cool_overlay_rates = np.array(
+        [
+            cooling_ramp_10_90_rate_c_per_min(r)
+            for r in cooling
+            if cooling_ramp_include_in_overlay(r)
+        ],
+        dtype=float,
+    )
+    n_hr = int(np.sum(np.isfinite(heat_overlay_rates)))
+    n_cr = int(np.sum(np.isfinite(cool_overlay_rates)))
+    avg_ramp_up = float(np.nanmean(heat_overlay_rates)) if n_hr else float("nan")
+    avg_ramp_down = float(np.nanmean(cool_overlay_rates)) if n_cr else float("nan")
+    _fmt_rate = lambda v: f"{v:.3f}" if np.isfinite(v) else "n/a"
     print(
         f"Mean ramp-up (T_10 to T_90, {T_COLD_REF:g}–{T_HOT_REF:g} °C span): {avg_ramp_up:.4f} C/min "
-        f"(n={n_hr}); mean ramp-down (T_90 to T_10, same window; n={n_cr} ramps with both crossings): "
-        f"{avg_ramp_down:.4f} C/min."
+        f"(n={n_hr} monotonic overlay ramps with valid 10–90%; {n_hr_all} total heating with finite rate); "
+        f"mean ramp-down (T_90 to T_10 where applicable; leading ramp may omit 10–90): {avg_ramp_down:.4f} C/min "
+        f"(n={n_cr} monotonic overlay; {n_cr_all} total cooling with finite rate)."
     )
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
     for ramp in heating:
+        if not heating_ramp_include_in_overlay(ramp):
+            continue
         i0, i1 = ramp["i0"], ramp["i1"]
         tt = ramp["t_sec"][i0 : i1 + 1] - ramp["t_sec"][i0]
         TT = ramp["T"][i0 : i1 + 1]
@@ -906,7 +1073,7 @@ def run_analysis(
     axes[0].text(
         0.03,
         0.97,
-        f"Avg ramp-up (10–90%):\n{avg_ramp_up:.3f} C/min\n(n={n_hr})",
+        f"Avg ramp-up (10–90%):\n{_fmt_rate(avg_ramp_up)} C/min\n(n={n_hr})",
         transform=axes[0].transAxes,
         va="top",
         ha="left",
@@ -914,9 +1081,8 @@ def run_analysis(
         bbox=dict(boxstyle="round,pad=0.35", facecolor="wheat", alpha=0.85, edgecolor="0.5"),
     )
 
-    # Only overlay cooling ramps that span T_90→T_10 (same 10–90% window as metrics).
     for ramp in cooling:
-        if measure_cooling_10_90(ramp)[2] != "ok":
+        if not cooling_ramp_include_in_overlay(ramp):
             continue
         i0, i1 = ramp["i0"], ramp["i1"]
         tt = ramp["t_sec"][i0 : i1 + 1] - ramp["t_sec"][i0]
@@ -929,7 +1095,7 @@ def run_analysis(
     axes[1].text(
         0.03,
         0.97,
-        f"Avg ramp-down (10-90%):\n{avg_ramp_down:.3f} C/min\n(n={n_cr})",
+        f"Avg ramp-down (10–90%):\n{_fmt_rate(avg_ramp_down)} C/min\n(n={n_cr})",
         transform=axes[1].transAxes,
         va="top",
         ha="left",
@@ -937,7 +1103,7 @@ def run_analysis(
         bbox=dict(boxstyle="round,pad=0.35", facecolor="lightcyan", alpha=0.85, edgecolor="0.5"),
     )
     fig.suptitle("ChamberT(M): all ramps (raw)", y=1.02)
-    #fig.suptitle("ChamberT(T): all ramps (raw)", y=1.02)
+    #fig.suptitle("ChamberT(T): monotonic ramps in overlay (raw)", y=1.02)
     fig.tight_layout()
     oc_path = fig_dir / "overlay_chamber_ramps.png"
     fig.savefig(oc_path, dpi=150, bbox_inches="tight")
@@ -1025,6 +1191,8 @@ def run_analysis(
     use_init0 = False
     n_init_rejected_dwell = 0
     ch_init_for_dwell: pd.DataFrame | None = None
+    heating_init: list[dict] = []
+    cooling_init: list[dict] = []
     hot_tagged: list[tuple[str, tuple[int, int]]] = [("main", iv) for iv in hot_main]
     cold_tagged: list[tuple[str, tuple[int, int]]] = [("main", iv) for iv in cold_main]
 
@@ -1032,6 +1200,7 @@ def run_analysis(
         df_init = read_data(initial_csv_path)
         ch_init = chamber_series(df_init)
         ch_init_for_dwell = ch_init
+        heating_init, cooling_init = find_ramps(ch_init, cold_max, hot_min)
         print(
             f"Loaded Initial.csv: {len(df_init)} rows, {len(ch_init)} unique timestamps "
             "(soak set 0 only)."
@@ -1093,6 +1262,26 @@ def run_analysis(
         f"(initial set 0 prepended: {use_init0})."
     )
 
+    main_lead = main_has_leading_cooling_ramp(cooling)
+    cold_r_mono, hot_r_mono = soak_dwell_resistance_monotonic_flags(
+        cold_tagged,
+        hot_tagged,
+        use_init0=use_init0,
+        heating_main=heating,
+        cooling_main=cooling,
+        heating_init=heating_init,
+        cooling_init=cooling_init,
+        main_has_leading=main_lead,
+    )
+    n_cold_r_omit_mono = sum(1 for x in cold_r_mono if not x)
+    n_hot_r_omit_mono = sum(1 for x in hot_r_mono if not x)
+    if n_cold_r_omit_mono or n_hot_r_omit_mono:
+        print(
+            f"Soak R: omitting cold-dwell R for {n_cold_r_omit_mono} cycle(s) and hot-dwell R for "
+            f"{n_hot_r_omit_mono} cycle(s) (non-monotonic approach ramp).",
+            file=sys.stderr,
+        )
+
     cycle_index_base = 0 if (dual_soak and initial_csv_path is not None and use_init0) else 1
     dwell_df = build_soak_dwell_time_table(
         cold_tagged,
@@ -1100,6 +1289,8 @@ def run_analysis(
         ch,
         ch_init_for_dwell,
         cycle_index_base=cycle_index_base,
+        cold_dwell_r_monotonic_approach=cold_r_mono,
+        hot_dwell_r_monotonic_approach=hot_r_mono,
     )
     soak_dwell_path = out_dir_resolved / "soak_dwell_times.csv"
     mean_c = median_c = min_c = max_c = float("nan")
@@ -1173,6 +1364,8 @@ def run_analysis(
         "n_main_pairs_omitted_by_cap": paired_lost_to_cap,
         "initial_set0_prepended": use_init0,
         "n_cycles_analyzed_final": n_cyc,
+        "n_cold_dwell_r_omitted_nonmono_ramp": n_cold_r_omit_mono,
+        "n_hot_dwell_r_omitted_nonmono_ramp": n_hot_r_omit_mono,
         "soak_cold_dwell_mean_min": mean_c,
         "soak_cold_dwell_median_min": median_c,
         "soak_cold_dwell_min_min": min_c,
@@ -1294,12 +1487,15 @@ def run_analysis(
         gtag = gname.replace(" ", "")
 
         # One figure: hot (top) + cold (bottom), D1–D15 on shared x (slot per DUT), cycles pooled.
-        def _merged_soak_tagged(
-            intervals: list[tuple[str, tuple[int, int]]], dut: str
+        def _merged_soak_tagged_valid(
+            intervals: list[tuple[str, tuple[int, int]]],
+            dut: str,
+            valid: list[bool],
         ) -> np.ndarray:
             parts = [
                 resistances_tagged(src, i0, i1, gname, dut_col=dut)
-                for src, (i0, i1) in intervals
+                for ii, (src, (i0, i1)) in enumerate(intervals)
+                if ii < len(valid) and valid[ii]
             ]
             nonempty = [p for p in parts if p.size > 0]
             return np.concatenate(nonempty) if nonempty else np.array([])
@@ -1313,16 +1509,21 @@ def run_analysis(
                 continue
             if (gi, d) in excluded:
                 continue
-            h_m = _merged_soak_tagged(hot_tagged, d)
+            h_m = _merged_soak_tagged_valid(hot_tagged, d, hot_r_mono)
             if h_m.size > 0:
                 hot_series.append(h_m)
                 hot_pos.append(slot)
-            c_m = _merged_soak_tagged(cold_tagged, d)
+            c_m = _merged_soak_tagged_valid(cold_tagged, d, cold_r_mono)
             if c_m.size > 0:
                 cold_series.append(c_m)
                 cold_pos.append(slot)
-            for dwell, tagged in (("hot", hot_tagged), ("cold", cold_tagged)):
+            for dwell, tagged, valid in (
+                ("hot", hot_tagged, hot_r_mono),
+                ("cold", cold_tagged, cold_r_mono),
+            ):
                 for pair_i, (src, (i0, i1)) in enumerate(tagged):
+                    if pair_i < len(valid) and not valid[pair_i]:
+                        continue
                     arr = resistances_tagged(src, i0, i1, gname, dut_col=d)
                     v = np.asarray(arr, dtype=float)
                     v = v[np.isfinite(v)]
@@ -1439,11 +1640,15 @@ def run_analysis(
                 continue
             hot_gd = [
                 resistances_tagged(src, hs, he, gname, dut_col=d)
-                for src, (hs, he) in hot_tagged
+                if (i < len(hot_r_mono) and hot_r_mono[i])
+                else np.array([])
+                for i, (src, (hs, he)) in enumerate(hot_tagged)
             ]
             cold_gd = [
                 resistances_tagged(src, cs0, cs1, gname, dut_col=d)
-                for src, (cs0, cs1) in cold_tagged
+                if (i < len(cold_r_mono) and cold_r_mono[i])
+                else np.array([])
+                for i, (src, (cs0, cs1)) in enumerate(cold_tagged)
             ]
             save_soak_boxplot_hot_cold_combined(
                 hot_gd,
